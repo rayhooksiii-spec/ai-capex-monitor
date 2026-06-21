@@ -32,8 +32,8 @@ import feedparser
 
 # Email config (use SendGrid to bypass DigitalOcean SMTP block)
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "YOUR_SENDGRID_KEY")
-RECIPIENT_EMAIL = "raymond@example.com"  # Change to your email
-SENDER_EMAIL = "capex-monitor@yourdomain.com"  # SendGrid verified sender
+RECIPIENT_EMAIL = "ray.hooks.iii@gmail.com"  # Change to your email
+SENDER_EMAIL = "ray.hooks.iii@gmail.com"  # SendGrid verified sender
 
 # Slack webhook (optional, for in-app alerts)
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK", None)  # Optional

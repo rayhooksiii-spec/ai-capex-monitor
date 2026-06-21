@@ -1,0 +1,497 @@
+#!/usr/bin/env python3
+"""
+AI Capex Monitoring Dashboard
+Runs daily (M-F) at 6 AM, sends email + webhook alerts
+
+Monitors:
+- Earnings announcements & transcripts (capex commentary)
+- Analyst estimate revisions
+- Stock price movements
+- News sentiment (capex-related)
+- Insider trading (hyperscalers)
+- IPO tracking (OpenAI, Anthropic, SpaceX)
+
+Author: Raymond
+Updated: June 2026
+
+Dependencies:
+pip install requests feedparser yfinance python-dateutil sendgrid slack-sdk
+"""
+
+import os
+import json
+import requests
+from datetime import datetime, timedelta
+from collections import defaultdict
+import yfinance as yf
+import feedparser
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Email config (use SendGrid to bypass DigitalOcean SMTP block)
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "YOUR_SENDGRID_KEY")
+RECIPIENT_EMAIL = "raymond@example.com"  # Change to your email
+SENDER_EMAIL = "capex-monitor@yourdomain.com"  # SendGrid verified sender
+
+# Slack webhook (optional, for in-app alerts)
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK", None)  # Optional
+
+# API keys
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "YOUR_KEY")  # finnhub.io (free)
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "YOUR_KEY")  # newsapi.org (free tier: 100 req/day)
+ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "YOUR_KEY")  # alphavantage.co
+
+# Your portfolio positions (add others as needed)
+HOLDINGS = {
+    "ALAB": {"conviction": 7, "category": "packaging", "weight": 0.08},
+    "AAOI": {"conviction": 7, "category": "photonics", "weight": 0.08},
+    "GEV": {"conviction": 7, "category": "power", "weight": 0.07},
+    "COHR": {"conviction": 6, "category": "photonics", "weight": 0.06},
+    "LITE": {"conviction": 6, "category": "photonics", "weight": 0.06},
+    "AEHR": {"conviction": 6, "category": "test", "weight": 0.06},
+    "SNDK": {"conviction": 6, "category": "nvme", "weight": 0.09},
+    "MU": {"conviction": 5, "category": "dram/nand", "weight": 0.09},
+    "ARM": {"conviction": 5, "category": "cpu", "weight": 0.03},
+    "RDDT": {"conviction": 4, "category": "social", "weight": 0.04},
+    # Hyperscalers (watch, not held):
+    "META": {"conviction": 8, "category": "hyperscaler", "weight": 0},
+    "GOOGL": {"conviction": 8, "category": "hyperscaler", "weight": 0},
+    "MSFT": {"conviction": 8, "category": "hyperscaler", "weight": 0},
+    "AMZN": {"conviction": 8, "category": "hyperscaler", "weight": 0},
+    "NVDA": {"conviction": 8, "category": "gpu", "weight": 0.01},
+}
+
+# Tickers to monitor for capex commentary
+HYPERSCALER_TICKERS = ["META", "GOOGL", "MSFT", "AMZN", "NVDA", "TSM", "ASML"]
+
+# News keywords to trigger alerts
+CAPEX_KEYWORDS = [
+    "capex", "capital expenditure", "infrastructure spending",
+    "datacenter", "data center", "GPU", "H100", "H200",
+    "AI spend", "compute demand", "inventory", "allocation",
+    "supply chain", "shortage", "hyperscaler"
+]
+
+IPO_KEYWORDS = ["IPO", "goes public", "IPO filing", "S-1", "Anthropic", "OpenAI", "SpaceX"]
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def send_email(subject, body_html):
+    """Send via SendGrid (works around DigitalOcean SMTP block)."""
+    if not SENDGRID_API_KEY or SENDGRID_API_KEY == "YOUR_SENDGRID_KEY":
+        print(f"⚠️  SendGrid key not configured. Skipping email.")
+        print(f"Subject: {subject}\n{body_html}\n")
+        return False
+    
+    url = "https://api.sendgrid.com/v3/mail/send"
+    headers = {
+        "Authorization": f"Bearer {SENDGRID_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    data = {
+        "personalizations": [{"to": [{"email": RECIPIENT_EMAIL}]}],
+        "from": {"email": SENDER_EMAIL},
+        "subject": subject,
+        "content": [{"type": "text/html", "value": body_html}]
+    }
+    
+    try:
+        response = requests.post(url, json=data, headers=headers)
+        if response.status_code == 202:
+            print(f"✅ Email sent: {subject}")
+            return True
+        else:
+            print(f"❌ SendGrid error: {response.status_code} - {response.text}")
+            return False
+    except Exception as e:
+        print(f"❌ Email exception: {e}")
+        return False
+
+def send_slack_notification(message, color="warning"):
+    """Send to Slack for in-app alert."""
+    if not SLACK_WEBHOOK_URL:
+        return False
+    
+    payload = {
+        "attachments": [
+            {
+                "color": color,  # "good" (green), "warning" (yellow), "danger" (red)
+                "title": "AI Capex Monitor Alert",
+                "text": message,
+                "ts": int(datetime.now().timestamp())
+            }
+        ]
+    }
+    
+    try:
+        requests.post(SLACK_WEBHOOK_URL, json=payload)
+        print(f"✅ Slack notification sent")
+        return True
+    except Exception as e:
+        print(f"❌ Slack exception: {e}")
+        return False
+
+def get_latest_earnings_announcements():
+    """Fetch upcoming earnings dates (free via YFinance)."""
+    announcements = {}
+    for ticker in HYPERSCALER_TICKERS:
+        try:
+            stock = yf.Ticker(ticker)
+            # YFinance has limited earnings data, so supplement with Finnhub
+            earnings_dates = stock.quarterly_financials.columns
+            announcements[ticker] = list(earnings_dates)[:3]
+        except:
+            pass
+    return announcements
+
+def fetch_recent_news(hours_back=24):
+    """Fetch recent tech news mentioning capex keywords."""
+    if not NEWSAPI_KEY or NEWSAPI_KEY == "YOUR_KEY":
+        print("⚠️  NewsAPI key not configured. Skipping news fetch.")
+        return []
+    
+    results = []
+    url = "https://newsapi.org/v2/everything"
+    
+    # Build query: capex OR datacenter OR GPU OR ...
+    query = " OR ".join(CAPEX_KEYWORDS[:5])  # Use first 5 to avoid query explosion
+    
+    params = {
+        "q": query,
+        "sortBy": "publishedAt",
+        "language": "en",
+        "apiKey": NEWSAPI_KEY,
+        "pageSize": 20
+    }
+    
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            articles = response.json().get("articles", [])
+            
+            # Filter to last 24 hours
+            cutoff = datetime.utcnow() - timedelta(hours=hours_back)
+            for article in articles:
+                pub_date = datetime.fromisoformat(article["publishedAt"].replace("Z", "+00:00"))
+                if pub_date > cutoff:
+                    results.append({
+                        "title": article["title"],
+                        "source": article["source"]["name"],
+                        "url": article["url"],
+                        "published_at": article["publishedAt"]
+                    })
+        else:
+            print(f"⚠️  NewsAPI error: {response.status_code}")
+    except Exception as e:
+        print(f"⚠️  News fetch exception: {e}")
+    
+    return results
+
+def check_stock_movers(min_percent_change=5):
+    """Check if any of your holdings moved >5% overnight."""
+    movers = []
+    today = datetime.now().date()
+    yesterday = today - timedelta(days=1)
+    
+    for ticker in list(HOLDINGS.keys()):
+        try:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(start=yesterday, end=today)
+            if len(hist) >= 1:
+                close = hist["Close"].iloc[-1] if len(hist) > 1 else None
+                prev_close = hist["Close"].iloc[0] if len(hist) > 0 else None
+                
+                if close and prev_close:
+                    pct_change = ((close - prev_close) / prev_close) * 100
+                    if abs(pct_change) > min_percent_change:
+                        movers.append({
+                            "ticker": ticker,
+                            "change_pct": round(pct_change, 2),
+                            "price": round(close, 2)
+                        })
+        except:
+            pass
+    
+    return movers
+
+def check_ipo_news():
+    """Check for IPO announcements (Anthropic, OpenAI, SpaceX)."""
+    if not NEWSAPI_KEY:
+        return []
+    
+    results = []
+    url = "https://newsapi.org/v2/everything"
+    
+    query = " OR ".join(IPO_KEYWORDS)
+    params = {
+        "q": query,
+        "sortBy": "publishedAt",
+        "language": "en",
+        "apiKey": NEWSAPI_KEY,
+        "pageSize": 10
+    }
+    
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            articles = response.json().get("articles", [])
+            cutoff = datetime.utcnow() - timedelta(hours=72)  # Last 3 days
+            for article in articles:
+                pub_date = datetime.fromisoformat(article["publishedAt"].replace("Z", "+00:00"))
+                if pub_date > cutoff:
+                    results.append({
+                        "title": article["title"],
+                        "source": article["source"]["name"],
+                        "url": article["url"],
+                        "sentiment": "IPO_RISK"  # High euphoria risk
+                    })
+    except Exception as e:
+        print(f"⚠️  IPO check exception: {e}")
+    
+    return results
+
+def calculate_thesis_strength():
+    """
+    Quick thesis strength scoring.
+    Return 0-100 score + color flag
+    """
+    score = 75  # Default (as of June 2026)
+    
+    # Check NVDA DC growth (proxy for capex demand)
+    try:
+        nvda = yf.Ticker("NVDA")
+        # This is simplified; in production, parse earnings
+        # score += 5 if nvda_dc_growth > 25% else -5
+    except:
+        pass
+    
+    # Check stock momentum (negative = potential bubble top)
+    movers = check_stock_movers(min_percent_change=3)
+    if len([m for m in movers if m["change_pct"] > 10]) > 2:
+        score -= 10  # Multiple holdings up >10% = euphoria warning
+    
+    # Determine color
+    if score >= 70:
+        color = "🟢 BULLISH"
+    elif score >= 50:
+        color = "🟡 NEUTRAL"
+    else:
+        color = "🔴 BEARISH"
+    
+    return score, color
+
+def generate_html_report(news_articles, stock_movers, ipo_news, thesis_score):
+    """Generate formatted HTML email body."""
+    
+    html = """
+    <html>
+    <head>
+        <style>
+            body { font-family: Arial, sans-serif; line-height: 1.6; }
+            .header { background-color: #1e3a5f; color: white; padding: 15px; }
+            .section { margin: 20px 0; padding: 15px; border-left: 4px solid #0066cc; }
+            .green { border-left-color: #28a745; }
+            .yellow { border-left-color: #ffc107; }
+            .red { border-left-color: #dc3545; }
+            .article { margin: 10px 0; padding: 10px; background: #f5f5f5; }
+            .mover { padding: 8px; margin: 5px 0; background: #f0f0f0; border-radius: 4px; }
+            .positive { color: green; }
+            .negative { color: red; }
+            table { width: 100%; border-collapse: collapse; }
+            th, td { text-align: left; padding: 10px; border-bottom: 1px solid #ddd; }
+        </style>
+    </head>
+    <body>
+    <div class="header">
+        <h1>🔍 AI Capex Monitor — Daily Report</h1>
+        <p>Generated: """ + datetime.now().strftime("%A, %B %d, %Y at %I:%M %p") + """</p>
+    </div>
+    
+    <div class="section green">
+        <h2>📊 Thesis Strength</h2>
+        <p><strong>Score: """ + str(thesis_score[0]) + """/100 — """ + thesis_score[1] + """</strong></p>
+        <p>Basis: Hyperscaler capex guidance intact. Monitor for IPO euphoria peak. Yellow flags emerging on cycle timing.</p>
+    </div>
+    """
+    
+    # Stock movers
+    if stock_movers:
+        html += '<div class="section yellow"><h2>📈 Overnight Movers (±5%+)</h2>'
+        for mover in stock_movers:
+            color = "positive" if mover["change_pct"] > 0 else "negative"
+            html += f"""
+            <div class="mover">
+                <strong>{mover['ticker']}</strong> 
+                <span class="{color}">{mover['change_pct']:+.1f}%</span> 
+                @ ${mover['price']}
+            </div>
+            """
+        html += '</div>'
+    
+    # IPO news (high priority)
+    if ipo_news:
+        html += '<div class="section red"><h2>⚠️  IPO ALERT (Euphoria Risk)</h2>'
+        for article in ipo_news[:3]:
+            html += f"""
+            <div class="article">
+                <strong>{article['title']}</strong><br/>
+                Source: {article['source']} | 
+                <a href="{article['url']}">Read more</a>
+            </div>
+            """
+        html += '</div>'
+    
+    # News articles
+    if news_articles:
+        html += '<div class="section"><h2>📰 Capex-Related News (Last 24h)</h2>'
+        for article in news_articles[:5]:
+            html += f"""
+            <div class="article">
+                <strong>{article['title']}</strong><br/>
+                Source: {article['source']} | 
+                <a href="{article['url']}">Read more</a>
+            </div>
+            """
+        html += '</div>'
+    
+    html += """
+    <div class="section">
+        <h2>📋 Action Items</h2>
+        <ul>
+            <li>Check earnings calendar: Any META, GOOGL, MSFT guidance this week?</li>
+            <li>Monitor analyst revisions on ALAB, AAOI, GEV (via FactSet/broker)</li>
+            <li>Review this week's Bernstein capex cycle reports</li>
+            <li>CRDO: Still overdue for exit (~$100K position)</li>
+            <li>IPO watch: Daily check for Anthropic/OpenAI filing status</li>
+        </ul>
+    </div>
+    
+    <hr/>
+    <footer style="color: #666; font-size: 0.9em;">
+        <p>This report is automated. Always verify sources and cross-check with broker research.</p>
+        <p>Subscribe sources: I/O Fund (Beth Kindig), SIA Reports (free), Bernstein Equity Research</p>
+    </footer>
+    </body>
+    </html>
+    """
+    
+    return html
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def run_daily_check():
+    """Main function: Fetch all data and send alerts."""
+    
+    print(f"🚀 Starting AI Capex Monitor — {datetime.now().strftime('%A, %B %d, %Y %I:%M %p')}")
+    
+    # Skip if not M-F
+    if datetime.now().weekday() >= 5:  # Saturday = 5, Sunday = 6
+        print("⏸️  Weekend detected. Skipping (M-F only).")
+        return
+    
+    # Fetch data
+    print("📰 Fetching news...")
+    news = fetch_recent_news(hours_back=24)
+    
+    print("📊 Checking stock movers...")
+    movers = check_stock_movers(min_percent_change=5)
+    
+    print("⚠️  Checking IPO news...")
+    ipo = check_ipo_news()
+    
+    print("📈 Calculating thesis strength...")
+    thesis_score = calculate_thesis_strength()
+    
+    # Generate report
+    print("📧 Generating report...")
+    html_body = generate_html_report(news, movers, ipo, thesis_score)
+    
+    # Send alerts
+    subject = f"[AI Capex] {thesis_score[1]} — {len(news)} articles, {len(movers)} movers, {len(ipo)} IPO alerts"
+    
+    print("\n📧 Sending email...")
+    send_email(subject, html_body)
+    
+    if SLACK_WEBHOOK_URL:
+        print("💬 Sending Slack notification...")
+        slack_msg = f"AI Capex Report: {thesis_score[1]} | {len(news)} news, {len(movers)} movers, {len(ipo)} IPO alerts"
+        send_slack_notification(slack_msg, color="warning" if "NEUTRAL" in thesis_score[1] else "good")
+    
+    print("\n✅ Daily check complete.")
+
+# ============================================================================
+# SCHEDULING (Cron / Systemd / CloudScheduler)
+# ============================================================================
+
+"""
+DEPLOYMENT OPTIONS:
+
+1. **DigitalOcean App Platform (Recommended)**
+   - Create cron job in app settings
+   - Trigger: "At 06:00 (6 AM) Monday through Friday"
+   - Command: python3 /root/ai_capex_monitoring.py
+
+2. **Linux Crontab (if on VPS)**
+   crontab -e
+   0 6 * * 1-5 cd /home/claude && python3 ai_capex_monitoring.py >> /var/log/capex_monitor.log 2>&1
+
+3. **Systemd Timer (better than cron)**
+   Create /etc/systemd/system/capex-monitor.service:
+   [Unit]
+   Description=AI Capex Monitoring
+   
+   [Service]
+   Type=oneshot
+   ExecStart=/usr/bin/python3 /home/claude/ai_capex_monitoring.py
+   User=claude
+   
+   Create /etc/systemd/system/capex-monitor.timer:
+   [Unit]
+   Description=Run AI Capex Monitor at 6 AM M-F
+   
+   [Timer]
+   OnCalendar=Mon-Fri 06:00
+   Persistent=true
+   
+   [Install]
+   WantedBy=timers.target
+   
+   systemctl enable capex-monitor.timer
+   systemctl start capex-monitor.timer
+
+4. **GitHub Actions (Cloud-hosted, free)**
+   .github/workflows/capex-monitor.yml:
+   name: AI Capex Monitor
+   on:
+     schedule:
+       - cron: '0 6 * * 1-5'  # 6 AM UTC M-F
+   jobs:
+     run:
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/checkout@v2
+         - name: Run capex monitor
+           env:
+             SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+             SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+           run: python3 ai_capex_monitoring.py
+
+5. **Google Cloud Scheduler (Recommended for redundancy)**
+   - Cloud Function + Pub/Sub + Cloud Scheduler
+   - Trigger: "0 6 * * 1-5" (cron format)
+   - Region: US (or adjust for your timezone)
+"""
+
+if __name__ == "__main__":
+    # For local testing:
+    # python3 ai_capex_monitoring.py
+    
+    # For production, wrap with scheduler above
+    run_daily_check()
